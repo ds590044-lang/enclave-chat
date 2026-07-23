@@ -1,0 +1,98 @@
+rules_version = '2';
+
+// ============================================================================
+// How to install this:
+//   Firebase Console -> Firestore Database -> Rules tab -> replace everything
+//   with this file's contents -> Publish.
+//
+// Why this file matters so much in this app:
+//   There is no server. This is the ONLY thing standing between "an admin
+//   created your account" and "a stranger reads everyone's messages." Every
+//   read and write the app ever does is checked against these rules, not
+//   just the app's own JavaScript (which anyone could bypass by hand).
+// ============================================================================
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function hasProfile() {
+      return isSignedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Deactivating someone (or them never having a profile at all) cuts
+    // them off here, immediately, everywhere - this is the real enforcement
+    // of "deactivated accounts lose access."
+    function isActiveUser() {
+      return hasProfile() && myProfile().is_active == true;
+    }
+
+    function isAdmin() {
+      return isActiveUser() && myProfile().role == 'admin';
+    }
+
+    // A minimal, deliberately small public lookup so the login page can
+    // resolve "username -> email" before the person is signed in (Firebase
+    // Auth itself only understands email, not username). Only the email is
+    // stored here - nothing else about the account.
+    match /usernameIndex/{username} {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isActiveUser();
+      allow create: if isAdmin();
+      // Admins can change anything on a profile (role, is_active, etc).
+      // A signed-in person can update ONLY their own "lastSeen" heartbeat -
+      // nothing else about their own account is self-editable.
+      allow update: if isAdmin()
+        || (isActiveUser() && request.auth.uid == userId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lastSeen']));
+      allow delete: if false; // accounts are deactivated, never deleted
+    }
+
+    match /conversations/{conversationId} {
+      allow read: if isActiveUser() && request.auth.uid in resource.data.participants;
+      allow create: if isActiveUser()
+        && request.auth.uid in request.resource.data.participants
+        && request.resource.data.participants.size() == 2;
+      allow update: if isActiveUser()
+        && request.auth.uid in resource.data.participants
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['unreadCount', 'typing', 'updatedAt', 'lastMessage']);
+      allow delete: if false;
+
+      match /messages/{messageId} {
+        function conversationParticipants() {
+          return get(/databases/$(database)/documents/conversations/$(conversationId)).data.participants;
+        }
+
+        allow read: if isActiveUser() && request.auth.uid in conversationParticipants();
+
+        allow create: if isActiveUser()
+          && request.auth.uid in conversationParticipants()
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string
+          && request.resource.data.text.size() > 0
+          && request.resource.data.text.size() <= 2000;
+
+        // Only the recipient can flip a message to "read" - and that's the
+        // only field anyone is ever allowed to change after a message is sent.
+        allow update: if isActiveUser()
+          && request.auth.uid in conversationParticipants()
+          && resource.data.senderId != request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['isRead']);
+
+        allow delete: if false;
+      }
+    }
+  }
+}
